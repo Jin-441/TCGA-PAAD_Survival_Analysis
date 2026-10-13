@@ -1,0 +1,355 @@
+---
+title: "TCGA-PAAD Survival Analysis Code"
+output:
+ word_document: default
+date: "2026-09-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = FALSE,
+  results = "hide",
+  message = FALSE,
+  warning = FALSE    
+)
+```
+
+### package install 및 load
+```{r}
+#if(!requireNamespace("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+#BiocManager::install("TCGAbiolinks")
+#BiocManager::install("DESeq2")
+#install.packages("ggplot2")
+#install.packages("ggrepel")
+#install.packages("dplyr")
+#install.packages("glmnet")
+#install.packages("survival")
+#install.packages("survminer")
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(glmnet)
+library(survival)
+library(survminer)
+```
+
+## 1단계: 데이터 수집 및 전처리
+### TCGA projects 확인
+```{r}
+projects <- getGDCprojects()
+head(projects$project_id)
+```
+
+### DATA 검색
+```{r}
+TCGAbiolinks:::getProjectSummary("TCGA-PAAD")
+query <- GDCquery(
+    project = "TCGA-PAAD",
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts"
+)
+
+# DATA 다운로드
+GDCdownload(query, method = "api", files.per.chunk = 10)
+```
+
+### 사용 가능하도록 DATA format 변경
+```{r}
+# 다운로드한 데이터를 R에서 사용할 수 있는 형태로 정리
+# SummarizedExperiment object가 만들어짐
+data_se <- GDCprepare(query)
+
+# 환자 정보 중 조직의 종류(정상, 암 등) 확인
+colData(data_se)$sample_type # Primary Tumor, Solid Tissue Normal, Metastatic
+
+# 각 종류의 개수 확인
+table(colData(data_se)$sample_type)
+
+# 단 하나 존재하는 Metastatic 제거
+data_se <- data_se[, data_se$sample_type != "Metastatic"] # Metastatic: 전이
+# 제거 확인
+table(colData(data_se)$sample_type)
+
+# DATA 확인
+head(colData(data_se))
+count_matrix <- assay(data_se) # 행은 유전자를, 열은 sample들을 포함함. 교차점은 발현량.
+head(count_matrix)
+```
+
+## 2단계: DATA pre-processing (전처리)
+```{r}
+# gene_id와 gene_name(symbol)의 1:1 매핑 데이터프레임 만듦(추후 쓰임)
+gene_anno <- as.data.frame(rowData(data_se))[, c("gene_id", "gene_name")]
+
+
+# 객체 만들기
+
+# 정상군을 reference(기준군)로 고정 -> 정상(Solid Tissue Normal) 대비 암(Primary Tumor) 발현량으로 변경
+colData(data_se)$sample_type <- relevel(as.factor(colData(data_se)$sample_type), ref = "Solid Tissue Normal")
+# 샘플들에 대해 기록되어 있는 모든 변수(열 이름) 확인
+colnames(colData(data_se))
+# 객체 생성
+data_se_a<-DESeqDataSet(data_se, design = ~sample_type) # design: 유전자 발현량 변화의 원인(독립변수)으로 가정하고 통계 검정을 하고 싶은 조건
+
+
+# 저발현 유전자 필터링 (Pre-filtering)
+
+# 통계적 하한선으로 가장 작은 그룹의 샘플 수(smallest group size)를 지정
+table(colData(data_se)$sample_type) # 4 나옴
+# 발현량이 거의 0에 가까운 유전자들을 잘라냄
+# 보통 유전자 발현 카운트 수 10을 신뢰할만한 최소한의 신호로 봄
+smallestGroupSize <- 4
+# 유전자 카운트 ≤ 10인 샘플 수가 최소 그룹 크기(smallest group size) 이상인가?
+keep <- rowSums(counts(data_se_a) >= 10) >= smallestGroupSize
+data_se_a <- data_se_a[keep,] # 전처리 완료 객체
+```
+
+## 3단계: DESeq2 기반 DEG 분석 및 FDR 다중 검정 보정 적용
+### Differential expression analysis (차등 발현 분석)
+```{r}
+data_se_b <- DESeq(data_se_a)
+result_ <- results(data_se_b)
+
+# 유의한 유전자 확인 (DEG 결과 요약)
+summary(result_)
+
+# adjusted p-value가 0.05보다 낮은 유전자 개수
+sum(result_$padj < 0.05, na.rm=TRUE)
+
+
+# 바이오마커 후보 탐색
+# 유의미한 서브셋 설정(결측치 제거 포함)
+# data_se_b는 모델 객체이기 때문에 p 값 없음. 따라서 결과 객체인 result_에서 자름.
+# padj < 0.05 & |LFC| >= 1
+res_sig <- subset(result_, padj < 0.05 & abs(log2FoldChange) >= 1)
+
+# 선별된 유전자 개수 확인
+nrow(res_sig)
+```
+
+## 4단계: R ggplot2 기반 시각화(Volcano Plot)
+### Dataframe으로 가공
+### 전체 유전자 분포를 전제로 하므로 result_ 사용
+```{r}
+res_df <- as.data.frame(result_)
+res_df <- na.omit(res_df)
+
+# res_df에서 행 이름으로 있던 유전자 ID를 gene 열로 꺼내줌
+res_df$gene <- rownames(res_df)
+# res_df에 gene 열과 match되는 symbol 열 추가함
+res_df$Symbol <- gene_anno$gene_name[match(res_df$gene, gene_anno$gene_id)]
+# symbol이 없는 경우 원래의 gene ID를 쓰도록 보완
+res_df$label_name <- ifelse(is.na(res_df$Symbol), res_df$gene, res_df$Symbol)
+
+# 기준: |log2FoldChange| >= 1 & padj < 0.05
+res_df <- res_df %>%
+  mutate(change = case_when(
+    log2FoldChange >= 1 & padj < 0.05  ~ "Up-regulated",
+    log2FoldChange <= -1 & padj < 0.05 ~ "Down-regulated",
+    TRUE                             ~ "Not Significant"
+  ))
+
+# 각 그룹별 유전자 개수 확인
+table(res_df$change)
+```
+
+### Visualization
+```{r}
+# plot에 라벨링할 상위 10개 유의 유전자를 선택
+top_genes <- res_df %>%
+  filter(change != "Not Significant") %>%
+  arrange(padj) %>%
+  head(10)
+
+# ggplot2를 사용하여 Volcano Plot을 생성
+vol_plot <- ggplot(data = res_df, aes(x = log2FoldChange, y = -log10(padj), color = change)) +
+  # 점 그래프 (Scatter plot)
+  geom_point(alpha = 0.6, size = 2) +
+  
+  # 색상 직접 지정
+  scale_color_manual(name = "Expression Change",
+                     values = c("Up-regulated" = "#E64B35FF", "Down-regulated" = "#0073C2FF", "Not Significant" = "grey")) +
+  
+  # 유의성 기준선 추가 (점선)
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  
+  # ggrepel을 이용해 겹치지 않게 유전자 라벨 추가
+  geom_text_repel(data = top_genes,
+                  aes(label = label_name),
+                  box.padding = 0.5,
+                  max.overlaps = Inf) +
+  
+  # 전체적인 테마 및 제목, 축 이름 설정
+  theme_bw(base_size = 14) +
+  labs(title = "Differential Gene Expression",
+       subtitle = "Primary Tumor vs Solid Tissue Normal in Pancreatic Cancer",
+       x = expression(log[2] ~ "Fold Change"),
+       y = expression(-log[10] ~ (italic(p)[adj]))
+       )
+print(vol_plot)
+```
+
+## 5단계: Lasso 및 다변량 Cox 생존분석 모델 구축
+### Extracting transformed values
+```{r}
+# 501개 DEG의 분산 안정화(vst) 발현량 행렬 준비
+# data_se_b: 앞서 DESeq 돌린 객체
+vsd <- vst(data_se_b, blind = FALSE) # Count의 분산이 평균발현량 크기에 상관없이 전 구간에서 일정하도록 비선형 변환 가함.
+# matrix로 변환
+expr_matrix <- assay(vsd)
+```
+
+### 선별한 501개 유전자 ID만 추출
+```{r}
+sig_gene_ids <- rownames(res_sig) # 선별된 핵심 유전자 ID에 대한 벡터
+expr_sub <- expr_matrix[sig_gene_ids, ] # [선별된 유전자 501 X 환자] 행렬
+# 차원(dimension) 확인
+dim(expr_sub)
+```
+
+### x 행렬 만들기: 전치해 [환자 x 유전자] 행렬로 변환
+```{r}
+tumor_samples <- colnames(data_se_b)[data_se_b$sample_type == "Primary Tumor"] # 암 환자 샘플만 남김 (생존 예측 모델이기 때문에 정상은 필요x)
+x_matrix <- t(expr_sub[, tumor_samples]) # [암환자 x 유전자] 행렬로 전치
+```
+
+### y 생존 객체 만들기 (메타데이터에서 time과 status 추출)
+```{r}
+# 환자에 대한 부가 정보(열)를 가져오기(사망 여부, 생존 일수 등)
+meta <- as.data.frame(colData(data_se_b)[tumor_samples, ])
+
+# TCGA 생존 변수 정제 (사망 환자는 days_to_death(사망까지 걸린 일수), 생존 환자는 days_to_last_follow_up)
+# y 생존 객체를 만들기 위해 time(추적 관찰 기간), event(1=사건 발생, 0= 중도 절단) 정보 필수
+time <- ifelse(!is.na(meta$days_to_death), meta$days_to_death, meta$days_to_last_follow_up) # 생존했으면 na이므로 days_to_last_follow_up임
+
+table(meta$vital_status) # Alive, Death로 나옴
+status <- ifelse(meta$vital_status == "Dead", 1, 0) # 0/1 숫자 코딩
+
+y_surv <- Surv(time = as.numeric(time), event = as.numeric(status))
+
+# 결측치(NA, 생존 일수가 안 적혀 있는 것) 또는 time<=0(생존 기간이 0일 이하) 제거
+# status가 결측치인 것 제거
+valid_idx <- !is.na(time) & time > 0 & !is.na(status)
+
+# 결측치를 제거한 최종 x, y의 객체
+x_final <- x_matrix[valid_idx, ]
+y_final <- y_surv[valid_idx]
+```
+
+### 10-fold 교차 검증 Lasso-Cox 실행
+### 전체 데이터를 10개의 부분으로 나누어 9개로 학습하고 나머지 1개로 평가하는 과정을 10번 반복하여 모델의 성능을 측정하는 방법
+```{r}
+set.seed(1886) # 교차 검증 재현성을 위해 시드 고정
+
+# cv_fit: 10-fold 교차 검증을 수행 결과가 담긴 객체
+cv_fit <- cv.glmnet(
+  x = x_final,
+  y = y_final,
+  family = "cox",
+  alpha = 1,
+  nfolds = 10
+)
+# lamda.min: 교차 검증에서 예측 오차가 가장 최소가 되는 지점의 람다 값
+# lamda.1se(더 보수적인 기준): 1 표준오차 범위 내에 있는 가장 단순한 모델의 람다 값
+print(cv_fit)
+```
+
+### 최적의 람다 플롯 및 살아남은 유전자 확인
+```{r}
+plot(cv_fit)
+
+cv_fit$lambda.min # 0.1403566 나옴
+
+# lamda.1se는 print(cv_fit)에서 계수가 0이 아닌 유전자가 0개라고 나왔으므로 lamda.min 사용.
+# 최적 lambda(lambda.min) 시점의 회귀계수 추출
+coef_min <- coef(cv_fit, s = "lambda.min")
+head(coef_min)
+
+# 최적 lambda(lambda.min)에서 계수가 0이 아닌 유전자 추출
+active_indices <- which(as.numeric(coef_min) != 0)
+selected_genes <- rownames(coef_min)[active_indices]
+selected_coefs <- as.numeric(coef_min)[active_indices]
+
+# 최종 바이오마커 후보 유전자를 데이터프레임으로 확인 (확인용 객체)
+# 1열: 선별된 7개 유전자의 이름
+# 2열: 해당 유전자의 Lasso 회귀계수
+res_genes <- data.frame(
+  Gene = selected_genes,
+  Coefficient = selected_coefs
+)
+# gene symbol 담긴 열 추가
+res_genes$Symbol <- gene_anno$gene_name[match(res_genes$Gene, gene_anno$gene_id)]
+#결과 출력
+print(res_genes)
+```
+
+### 다변량 Cox 회귀 적합
+```{r}
+# 선별된 7개 유전자의 발현량만 x_final에서 추출
+cox_data <- as.data.frame(x_final[, selected_genes])
+
+# 생존 변수(time, status)를 결합
+cox_data$time <- as.numeric(y_final[, "time"])
+cox_data$status <- as.numeric(y_final[, "status"])
+
+# 다변량 Cox 모델 적합
+# 변수: selected_genes (7개의 바이오마커 후보)
+cox_genes <- as.formula(paste("Surv(time, status) ~ ", paste(selected_genes, collapse = " + ")))
+
+cox_obj <- coxph(cox_genes, data = cox_data)
+
+summary(cox_obj)
+```
+
+### 위험 점수(Risk Score) 산출
+```{r}
+risk.score <- predict(cox_obj, type="lp")
+
+# cox_data에 risk_score 열 추가
+cox_data$risk_score <- risk.score
+
+# median 계산
+risk_standard <- median(risk.score)
+
+# median을 기준으로 high-risk, low-risk 환자 레이블 지정
+cox_data <- cox_data %>%
+  mutate(risk_group = case_when(
+    risk_score >= risk_standard  ~ "High-risk",
+    TRUE                             ~ "Low-risk"
+  ))
+```
+
+## 6단계: R ggplot2 기반 시각화(생존 곡선)
+### Kaplan-Meier 생존 분석
+### 두 그룹 간 생존 곡선 차이가 실제로 벌어지는가?
+```{r}
+# 생존 곡선 estimate
+fit <- survfit(Surv(time, status) ~ risk_group, data = cox_data)
+print(fit)
+names(fit$strata) # 실제 그룹 순서 확인
+# 시각화
+KM_plot <- ggsurvplot(
+  fit,
+  data = cox_data,
+  risk.table = TRUE,        # number at risk under the plot
+  conf.int = TRUE,          # 95% confidence bands
+  pval = TRUE,              # log-rank p-value on the plot
+  surv.median.line = "hv",  # dashed median-survival guides
+  palette = "jco",          # colourblind-safe journal palette
+  legend.labs = c("High-risk", "Low-risk"),
+  legend.title = "Risk group",
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  ggtheme = theme_minimal()
+)
+
+print(KM_plot)
+```
