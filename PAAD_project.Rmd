@@ -27,6 +27,7 @@ knitr::opts_chunk$set(
 #install.packages("glmnet")
 #install.packages("survival")
 #install.packages("survminer")
+#install.packages("forestmodel")
 
 library(TCGAbiolinks)
 library(SummarizedExperiment)
@@ -37,6 +38,7 @@ library(dplyr)
 library(glmnet)
 library(survival)
 library(survminer)
+library(forestmodel)
 ```
 
 ## 1단계: 데이터 수집 및 전처리
@@ -309,6 +311,41 @@ cox_obj <- coxph(cox_genes, data = cox_data)
 summary(cox_obj)
 ```
 
+### Forest Plot
+```{r}
+# 기존 cox_obj에서 적합에 사용된 데이터 가져오기
+mf_cox <- model.frame(cox_obj)
+
+# Surv 객체(1번째 열)를 time과 status 순수 벡터로 분리
+surv_mat <- mf_cox[[1]]
+df_cox <- data.frame(
+  time   = surv_mat[, 1],
+  status = surv_mat[, 2]
+)
+
+# 유전자 발현량 열들 붙이기
+gene_cols <- mf_cox[, -1, drop = FALSE]
+original_genes <- colnames(gene_cols)
+
+# gene_anno를 통한 Symbol 매칭 (res_df 방식)
+matched_symbols <- gene_anno$gene_name[match(original_genes, gene_anno$gene_id)]
+new_symbols <- ifelse(is.na(matched_symbols) | matched_symbols == "", 
+                      original_genes, 
+                      matched_symbols)
+new_symbols <- make.unique(new_symbols)
+
+colnames(gene_cols) <- new_symbols
+df_cox <- cbind(df_cox, gene_cols)
+
+# 새 formula 생성 및 모델 재적합
+new_formula <- as.formula(paste("Surv(time, status) ~", paste(new_symbols, collapse = " + ")))
+cox_obj_symbol <- coxph(new_formula, data = df_cox)
+
+# forestmodel 플롯 생성
+p_forest <- forest_model(cox_obj_symbol)
+print(p_forest)
+```
+
 ### 위험 점수(Risk Score) 산출
 ```{r}
 risk.score <- predict(cox_obj, type="lp")
@@ -350,6 +387,7 @@ KM_plot <- ggsurvplot(
   ylab = "Survival probability",
   ggtheme = theme_minimal()
 )
+
 
 print(KM_plot)
 ```
