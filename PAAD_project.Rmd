@@ -413,11 +413,3 @@ cox_obj_symbol <- coxph(new_formula, data = df_cox)
 p_forest <- forest_model(cox_obj_symbol)
 print(p_forest)
 ```
-
-### 위험 점수(Risk Score) 산출
-```{r}
-risk.score <- predict(cox_train_obj, type="lp")
-
-# cox_data에 risk_score 열 추가
-cox_train_data$risk_score <- risk.score
-```
